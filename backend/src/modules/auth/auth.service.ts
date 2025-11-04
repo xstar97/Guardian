@@ -54,7 +54,7 @@ export class AuthService {
       throw new BadRequestException('Passwords do not match');
     }
 
-    // Hash password with bcrypt (cost factor 12)
+    // Hash password with bcrypt
     const passwordHash = await bcrypt.hash(dto.password, 12);
 
     try {
@@ -78,7 +78,8 @@ export class AuthService {
         session,
       };
     } catch (error) {
-      if (error.code === 'SQLITE_CONSTRAINT') {
+      const dbError = error as { code?: string };
+      if (dbError.code === 'SQLITE_CONSTRAINT') {
         throw new BadRequestException('Username or email already exists');
       }
       throw new InternalServerErrorException('Failed to create admin user');
@@ -126,7 +127,13 @@ export class AuthService {
   /**
    * Create a new session for a user
    */
-  private async createSession(userId: string): Promise<any> {
+  private async createSession(userId: string): Promise<{
+    id: string;
+    userId: string;
+    token: string;
+    expiresAt: Date;
+    createdAt: Date;
+  }> {
     // Generate secure token (32 bytes/256 bits)
     const token = crypto.randomBytes(32).toString('hex');
 
@@ -153,7 +160,9 @@ export class AuthService {
   /**
    * Validate and retrieve session
    */
-  async validateSession(token: string): Promise<AdminUser | null> {
+  async validateSession(
+    token: string,
+  ): Promise<(AdminUser & { sessionId: string }) | null> {
     try {
       // Find session
       const session = await this.sessionRepository.findOne({
@@ -175,8 +184,11 @@ export class AuthService {
       session.lastActivityAt = new Date();
       await this.sessionRepository.save(session);
 
-      return session.user;
-    } catch (error) {
+      return {
+        ...session.user,
+        sessionId: session.id,
+      };
+    } catch {
       return null;
     }
   }
@@ -258,7 +270,7 @@ export class AuthService {
         email: user.email,
         avatarUrl: user.avatarUrl,
       };
-    } catch (error) {
+    } catch {
       throw new InternalServerErrorException('Failed to update profile');
     }
   }
@@ -266,7 +278,11 @@ export class AuthService {
   /**
    * Update user password
    */
-  async updatePassword(userId: string, dto: UpdatePasswordDto): Promise<void> {
+  async updatePassword(
+    userId: string,
+    dto: UpdatePasswordDto,
+    currentSessionId?: string,
+  ): Promise<void> {
     const user = await this.adminUserRepository.findOne({
       where: { id: userId },
     });
@@ -295,8 +311,56 @@ export class AuthService {
     try {
       user.passwordHash = newPasswordHash;
       await this.adminUserRepository.save(user);
-    } catch (error) {
+
+      // Clear all sessions except current one if requested
+      if (dto.clearSessions) {
+        await this.clearAllSessions(userId, currentSessionId);
+      }
+    } catch {
       throw new InternalServerErrorException('Failed to update password');
     }
+  }
+
+  /**
+   * Clear all sessions for a user except optionally the current session
+   */
+  async clearAllSessions(
+    userId: string,
+    currentSessionId?: string,
+  ): Promise<void> {
+    try {
+      if (currentSessionId) {
+        // Delete all sessions except the current one
+        await this.sessionRepository
+          .createQueryBuilder()
+          .delete()
+          .where('userId = :userId AND id != :currentSessionId', {
+            userId,
+            currentSessionId,
+          })
+          .execute();
+      } else {
+        await this.sessionRepository.delete({ userId });
+      }
+    } catch {
+      throw new InternalServerErrorException('Failed to clear sessions');
+    }
+  }
+
+  /**
+   * Validate user's current password for admin operations
+   */
+  async validatePassword(userId: string, password: string): Promise<boolean> {
+    const user = await this.adminUserRepository.findOne({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    // Verify password
+    const passwordValid = await bcrypt.compare(password, user.passwordHash);
+    return passwordValid;
   }
 }
